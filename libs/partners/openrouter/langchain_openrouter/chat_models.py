@@ -83,6 +83,24 @@ def _get_default_model_profile(model_name: str) -> ModelProfile:
     return default.copy()
 
 
+def _create_stream_generation_info(
+    chunk_dict: dict[str, Any], choice: dict[str, Any], model_name: str
+) -> dict[str, Any]:
+    generation_info = {"finish_reason": choice["finish_reason"]}
+    generation_info["model_name"] = chunk_dict.get("model") or model_name
+    if system_fingerprint := chunk_dict.get("system_fingerprint"):
+        generation_info["system_fingerprint"] = system_fingerprint
+    if native_finish_reason := choice.get("native_finish_reason"):
+        generation_info["native_finish_reason"] = native_finish_reason
+    if response_id := chunk_dict.get("id"):
+        generation_info["id"] = response_id
+    if created := chunk_dict.get("created"):
+        generation_info["created"] = int(created)
+    if object_ := chunk_dict.get("object"):
+        generation_info["object"] = object_
+    return generation_info
+
+
 class ChatOpenRouter(BaseChatModel):
     """OpenRouter chat model integration.
 
@@ -122,6 +140,7 @@ class ChatOpenRouter(BaseChatModel):
         | `app_categories` | `list[str] | None` | Marketplace attribution categories. |
         | `session_id` | `str | None` | Group related requests for observability. |
         | `trace` | `dict[str, Any] | None` | Trace metadata for broadcasts. |
+        | `default_headers` | `Mapping[str, str] | None` | Extra request headers. |
         | `max_retries` | `int` | Max retries (default `2`). Set to `0` to disable. |
 
     ??? info "Instantiate"
@@ -295,6 +314,28 @@ class ChatOpenRouter(BaseChatModel):
     plugins: list[dict[str, Any]] | None = None
     """Plugins configuration for OpenRouter."""
 
+    default_headers: Mapping[str, str] | None = Field(default=None, exclude=True)
+    """Additional HTTP headers to include on every request to OpenRouter.
+
+    Headers set here become the underlying httpx client's default headers, so
+    they are sent on every request to OpenRouter. Useful for upstream provider
+    features that require custom headers — for example, xAI's `x-grok-conv-id`
+    for sticky-routing prompt cache hits, region routing, A/B test bucketing
+    headers, or provider-specific authentication. Whether a given header is
+    forwarded to the upstream provider (versus consumed by OpenRouter itself)
+    is determined by OpenRouter; consult its docs for which headers propagate.
+
+    Because these headers may contain credentials, they are excluded from
+    LangChain serialization.
+
+    Example: `{"x-grok-conv-id": "session-abc123"}`
+
+    Headers set via this field are merged with the OpenRouter app-attribution
+    headers (`HTTP-Referer`, `X-Title`, `X-OpenRouter-Categories`); on a
+    collision the value from `default_headers` takes precedence, matched
+    case-insensitively (HTTP header names are case-insensitive).
+    """
+
     session_id: str | None = Field(
         default_factory=from_env("OPENROUTER_SESSION_ID", default=None),
     )
@@ -303,7 +344,7 @@ class ChatOpenRouter(BaseChatModel):
     Useful any time multiple requests should share an observability
     grouping (e.g. a conversation, an agent workflow, a batch job, or a CI
     run). Equivalent to setting the `x-session-id` HTTP header on the
-    underlying request. OpenRouter rejects values longer than 128
+    underlying request. OpenRouter rejects values longer than 256
     characters.
 
     Falls back to the `OPENROUTER_SESSION_ID` environment variable when
@@ -387,6 +428,19 @@ class ChatOpenRouter(BaseChatModel):
             extra_headers["X-Title"] = self.app_title
         if self.app_categories:
             extra_headers["X-OpenRouter-Categories"] = ",".join(self.app_categories)
+        # User-supplied headers take precedence over the built-in
+        # app-attribution headers on collision. HTTP header names are
+        # case-insensitive, so drop any built-in whose name case-insensitively
+        # matches a user header before merging; a plain dict update would keep
+        # both spellings and httpx would then send a doubled header.
+        if self.default_headers:
+            user_header_names = {name.casefold() for name in self.default_headers}
+            extra_headers = {
+                name: value
+                for name, value in extra_headers.items()
+                if name.casefold() not in user_header_names
+            }
+            extra_headers.update(self.default_headers)
         if extra_headers:
             import httpx  # noqa: PLC0415
 
@@ -534,7 +588,7 @@ class ChatOpenRouter(BaseChatModel):
         response = await self.client.chat.send_async(messages=message_dicts, **params)
         return self._create_chat_result(response)
 
-    def _stream(  # noqa: C901, PLR0912
+    def _stream(  # noqa: C901
         self,
         messages: list[BaseMessage],
         stop: list[str] | None = None,
@@ -548,6 +602,7 @@ class ChatOpenRouter(BaseChatModel):
         _strip_internal_kwargs(params)
 
         default_chunk_class: type[BaseMessageChunk] = AIMessageChunk
+        terminal_generation_info: dict[str, Any] = {}
         for chunk in self.client.chat.send(messages=message_dicts, **params):
             chunk_dict = chunk.model_dump(by_alias=True)
             if not chunk_dict.get("choices"):
@@ -576,21 +631,18 @@ class ChatOpenRouter(BaseChatModel):
                 chunk_dict, default_chunk_class
             )
             generation_info: dict[str, Any] = {}
-            if finish_reason := choice.get("finish_reason"):
-                generation_info["finish_reason"] = finish_reason
-                # Include response-level metadata on the final chunk
-                response_model = chunk_dict.get("model")
-                generation_info["model_name"] = response_model or self.model_name
-                if system_fingerprint := chunk_dict.get("system_fingerprint"):
-                    generation_info["system_fingerprint"] = system_fingerprint
-                if native_finish_reason := choice.get("native_finish_reason"):
-                    generation_info["native_finish_reason"] = native_finish_reason
-                if response_id := chunk_dict.get("id"):
-                    generation_info["id"] = response_id
-                if created := chunk_dict.get("created"):
-                    generation_info["created"] = int(created)
-                if object_ := chunk_dict.get("object"):
-                    generation_info["object"] = object_
+            if choice.get("finish_reason"):
+                candidate_generation_info = _create_stream_generation_info(
+                    chunk_dict, choice, self.model_name
+                )
+                generation_info.update(
+                    {
+                        key: value
+                        for key, value in candidate_generation_info.items()
+                        if key not in terminal_generation_info
+                    }
+                )
+                terminal_generation_info.update(generation_info)
             logprobs = choice.get("logprobs")
             if logprobs:
                 generation_info["logprobs"] = logprobs
@@ -619,7 +671,7 @@ class ChatOpenRouter(BaseChatModel):
                 )
             yield generation_chunk
 
-    async def _astream(  # noqa: C901, PLR0912
+    async def _astream(  # noqa: C901
         self,
         messages: list[BaseMessage],
         stop: list[str] | None = None,
@@ -633,6 +685,7 @@ class ChatOpenRouter(BaseChatModel):
         _strip_internal_kwargs(params)
 
         default_chunk_class: type[BaseMessageChunk] = AIMessageChunk
+        terminal_generation_info: dict[str, Any] = {}
         async for chunk in await self.client.chat.send_async(
             messages=message_dicts, **params
         ):
@@ -663,21 +716,18 @@ class ChatOpenRouter(BaseChatModel):
                 chunk_dict, default_chunk_class
             )
             generation_info: dict[str, Any] = {}
-            if finish_reason := choice.get("finish_reason"):
-                generation_info["finish_reason"] = finish_reason
-                # Include response-level metadata on the final chunk
-                response_model = chunk_dict.get("model")
-                generation_info["model_name"] = response_model or self.model_name
-                if system_fingerprint := chunk_dict.get("system_fingerprint"):
-                    generation_info["system_fingerprint"] = system_fingerprint
-                if native_finish_reason := choice.get("native_finish_reason"):
-                    generation_info["native_finish_reason"] = native_finish_reason
-                if response_id := chunk_dict.get("id"):
-                    generation_info["id"] = response_id
-                if created := chunk_dict.get("created"):
-                    generation_info["created"] = int(created)  # UNIX timestamp
-                if object_ := chunk_dict.get("object"):
-                    generation_info["object"] = object_
+            if choice.get("finish_reason"):
+                candidate_generation_info = _create_stream_generation_info(
+                    chunk_dict, choice, self.model_name
+                )
+                generation_info.update(
+                    {
+                        key: value
+                        for key, value in candidate_generation_info.items()
+                        if key not in terminal_generation_info
+                    }
+                )
+                terminal_generation_info.update(generation_info)
             logprobs = choice.get("logprobs")
             if logprobs:
                 generation_info["logprobs"] = logprobs
@@ -1125,6 +1175,19 @@ def _merge_reasoning_run(run: list[dict[str, Any]]) -> dict[str, Any]:
     return merged_entry
 
 
+def _strip_ephemeral_reasoning_ids(value: Any) -> Any:
+    """Remove OpenAI Responses reasoning item IDs from outbound payloads."""
+    if isinstance(value, list):
+        return [_strip_ephemeral_reasoning_ids(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _strip_ephemeral_reasoning_ids(item)
+            for key, item in value.items()
+            if not (key == "id" and isinstance(item, str) and item.startswith("rs_"))
+        }
+    return value
+
+
 def _merge_reasoning_details(
     details: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1244,8 +1307,8 @@ def _convert_message_to_dict(message: BaseMessage) -> dict[str, Any]:  # noqa: C
         if "reasoning_content" in message.additional_kwargs:
             message_dict["reasoning"] = message.additional_kwargs["reasoning_content"]
         if "reasoning_details" in message.additional_kwargs:
-            message_dict["reasoning_details"] = _merge_reasoning_details(
-                message.additional_kwargs["reasoning_details"]
+            message_dict["reasoning_details"] = _strip_ephemeral_reasoning_ids(
+                _merge_reasoning_details(message.additional_kwargs["reasoning_details"])
             )
     elif isinstance(message, SystemMessage):
         message_dict = {"role": "system", "content": message.content}
